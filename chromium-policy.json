@@ -1,0 +1,3 @@
+{
+  "URLBlocklist": ["msteams:*", "msteams-x-c2:*", "ms-teams:*", "teams:*"]
+}

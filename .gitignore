@@ -1,0 +1,22 @@
+# Secrets
+.env
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Browser profiles
+browser_profile_docker/
+browser_profile_docker_chromium/
+app/bot/browser_profile/
+
+# Debug/data artifacts
+data/
+app/bot/debug_snapshots/
+
+# Archives
+*.zip
+
+# Office lock files
+~$*.docx

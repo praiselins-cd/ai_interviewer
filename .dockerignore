@@ -1,0 +1,7 @@
+venv
+__pycache__
+*.pyc
+.env
+browser_profile_docker
+browser_profile_docker_chromium
+data
