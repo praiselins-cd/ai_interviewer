@@ -3,8 +3,9 @@
 Run as: python -m app.worker.interview_worker --interview-id ... --meeting-url ... --join-mode ... --details-file ...
 
 Drives the interview through the persisted state machine and delegates the
-actual Teams/Playwright/Realtime work to the existing, unchanged
-app.bot.engine.launch_bot() / launch_admitter().
+actual Teams/Playwright/Realtime work to app.bot.engine.launch_bot() (solo
+signed_in/guest_only modes) or launch_admitter_and_guest() (guest mode: one
+shared browser, two tabs).
 """
 import argparse
 import asyncio
@@ -13,7 +14,7 @@ import logging
 import os
 import sys
 
-from app.bot.engine import launch_bot, launch_admitter
+from app.bot.engine import launch_bot, launch_admitter_and_guest
 from app.state import machine as state_machine
 from app.state.machine import InterviewState
 from app.scheduling.capacity import mark_inactive
@@ -59,14 +60,16 @@ async def run(interview_id: str, meeting_url: str, join_mode: str, details: dict
 
         tasks = []
         if join_mode == "guest":
+            # Admitter and guest now run as two tabs in one shared browser
+            # process (see launch_admitter_and_guest) instead of each
+            # launching its own separate browser.
             admitter_ready = asyncio.Event()
-            tasks.append(asyncio.create_task(launch_admitter(meeting_url, ready_event=admitter_ready)))
             tasks.append(asyncio.create_task(
-                launch_bot(meeting_url=meeting_url, details=details, join_mode=join_mode, admitter_ready=admitter_ready)
+                launch_admitter_and_guest(meeting_url, details, admitter_ready=admitter_ready)
             ))
-            # The admitter (host) sets this once it's actually in the
-            # meeting and the guest may start joining — a real signal, not a
-            # guessed delay.
+            # The admitter sets this once it's actually in the meeting and
+            # the guest tab may start joining — a real signal, not a guessed
+            # delay.
             await admitter_ready.wait()
             await state_machine.transition(
                 interview_id, InterviewState.INTERVIEWER_JOINING, reason="admitter ready; guest bot joining"
@@ -79,9 +82,8 @@ async def run(interview_id: str, meeting_url: str, join_mode: str, details: dict
                 interview_id, InterviewState.INTERVIEWER_JOINING, reason="signed-in/guest-only bot joining"
             )
 
-        # NOTE: launch_bot()/launch_admitter() are reused unchanged, so this
-        # worker still doesn't have a direct signal for "guest is fully in
-        # the meeting, watching for the candidate" — that one transition
+        # NOTE: this worker still doesn't have a direct signal for "guest is
+        # fully in the meeting, watching for the candidate" — that one transition
         # stays best-effort/approximate here. AUDIO_CHECK, INTERVIEWING, and
         # CLOSING are real, driven by connection.py's tool-call handlers via
         # the interview_id now threaded through `details` above.

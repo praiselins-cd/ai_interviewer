@@ -15,6 +15,7 @@ WRAP_UP_THRESHOLD_SECONDS = 300
 HARD_CUTOFF_GRACE_SECONDS = 60
 AUDIO_CHECK_FAILURE_GRACE_SECONDS = 30
 MAX_AUDIO_CHECK_ATTEMPTS = 4
+SILENCE_REPROMPT_SECONDS = 20
 
 def render_time_status(remaining_seconds: float) -> str:
     minutes_remaining = max(0, int(remaining_seconds // 60))
@@ -70,6 +71,8 @@ VOICE OUTPUT RULES (critical, this is spoken, not written)
 - Ask ONE question at a time. Never stack multiple questions in one turn.
 - Keep your turns short: 1-3 sentences unless you're explaining a transition.
 - Use natural acknowledgments ("Got it", "That makes sense", "Interesting") before moving on, don't be robotic.
+- When moving to the next question, say the transition phrase and the next question together in the SAME turn. Never end a turn on a transition sentence alone (e.g. "Let's move to the next question.") and then stop talking — the candidate should never have to respond to a transition by itself, only to an actual question.
+- At any point, if the candidate's response is unclear, cut off, inaudible, or doesn't seem to address what you asked, ask them to clarify or repeat rather than guessing at their meaning or moving on as if they'd answered.
 - Talk naturally natural and make the candidate comfortable before starting the interview  
 ROLE AND TONE
 - You are professional, warm, and neutral. Never sound bored, impressed, frustrated,regardless of answer quality, candidates should not be able to read your evaluation from your tone but be suprised when the answer is excelle.
@@ -154,6 +157,8 @@ VOICE OUTPUT RULES (critical, this is spoken, not written)
 - Speak in plain natural sentences. Never use markdown, bullet points, numbered lists, asterisks, or headers.
 - Ask ONE question at a time. Keep turns short: 1-3 sentences unless transitioning.
 - Use natural acknowledgments before moving on, don't be robotic.
+- When moving to the next question, say the transition phrase and the next question together in the SAME turn — never end a turn on a transition sentence alone and wait for the candidate to respond to it.
+- At any point, if the candidate's response is unclear, cut off, inaudible, or doesn't address what you asked, ask them to clarify or repeat rather than guessing or moving on as if they'd answered.
 
 ROLE AND TONE
 - Professional, warm, neutral. Never reveal you are scoring or evaluating specific competencies.
@@ -327,7 +332,7 @@ async def handle_voice_bridge_ws(websocket, details: dict, end_call_callback=Non
                         "input": {
                             "transcription": {"model": "whisper-1", "language": "en"},
                             "format": {"type": "audio/pcm", "rate": 24000},
-                            "turn_detection": {"type": "server_vad", "silence_duration_ms": 6000}
+                            "turn_detection": {"type": "server_vad", "silence_duration_ms": 3000}
                         },
                         "output": {
                             "voice": "shimmer",
@@ -338,9 +343,53 @@ async def handle_voice_bridge_ws(websocket, details: dict, end_call_callback=Non
             }))
 
             greeted = False
+            candidate_video_on = True
+            video_prompt_sent = False
+            # Tracks "waiting for the candidate to respond" for the silence
+            # watchdog below: set to a timestamp whenever the AI finishes
+            # talking, cleared once the candidate actually starts speaking.
+            waiting_since = {"value": None}
+            silence_nudge_sent = False
+
+            async def prompt_video_on_if_still_off():
+                nonlocal video_prompt_sent
+                # Grace period so a brief camera glitch/toggle doesn't trigger
+                # a prompt -- only nag if it's actually been off a few seconds.
+                await asyncio.sleep(8)
+                if candidate_video_on or video_prompt_sent:
+                    return
+                video_prompt_sent = True
+                # Only updates the standing instructions -- deliberately does
+                # NOT force a response.create here. This can fire at any point
+                # in a live conversation (candidate mid-turn, about to speak,
+                # etc.), unlike the other response.create call sites in this
+                # file (greeting, audio-check retries, hard time cutoff),
+                # which only ever run when no candidate turn is in flight. An
+                # explicit response.create here would race with the server's
+                # own VAD-triggered auto-response for whatever the candidate
+                # is saying, producing two overlapping responses whose audio
+                # gets interleaved into one continuous playback stream on the
+                # client (heard as doubled/echoing audio), and whichever one
+                # is "active" when the candidate next speaks gets cancelled,
+                # clearing their input_audio_buffer and dropping what they
+                # just said. Letting the model pick this up on its own next
+                # natural turn avoids all of that -- matches how the periodic
+                # (non-final) TIME STATUS updates below are handled.
+                base_instructions = build_module2_instructions(details) if module2_mode else build_instructions(details)
+                await openai_ws.send(json.dumps({
+                    "type": "session.update",
+                    "session": {
+                        "type": "realtime",
+                        "instructions": base_instructions + (
+                            "\n\nNOTE: The candidate's camera appears to be off. Politely ask them "
+                            "to turn on their video before continuing, then proceed once they do "
+                            "(or once they say they'd rather keep it off)."
+                        ),
+                    }
+                }))
 
             async def handle_openai_responses():
-                nonlocal ai_responding, audio_check_attempts, audio_check_passed
+                nonlocal ai_responding, audio_check_attempts, audio_check_passed, silence_nudge_sent
                 try:
                     async for response in openai_ws:
                         data = json.loads(response)
@@ -494,6 +543,39 @@ async def handle_voice_bridge_ws(websocket, details: dict, end_call_callback=Non
                                 current_question_id["value"] = None
                                 await _tool_output({"status": "recorded"})
 
+                                # The prompt asks the model to speak its
+                                # transition + the next question (or closing
+                                # remarks) in this SAME turn, but that's only
+                                # a prompt-level instruction, not guaranteed --
+                                # the model can still end its response right
+                                # after the tool call with nothing more said.
+                                # Since turn_detection is server_vad, nothing
+                                # then ever prompts the model again (no new
+                                # candidate speech to trigger VAD, and nobody
+                                # asked a question for them to respond to),
+                                # so the call stalls silently forever. Detect
+                                # that: if the response ends without a new
+                                # question_started call (and the call isn't
+                                # already ending), force one more
+                                # response.create so the model continues.
+                                async def _continue_if_stalled():
+                                    await asyncio.sleep(0.5)
+                                    waited = 0.0
+                                    while ai_responding and waited < 12.0:
+                                        await asyncio.sleep(0.3)
+                                        waited += 0.3
+                                    if (
+                                        not ai_responding
+                                        and not end_call_event.is_set()
+                                        and current_question_id["value"] is None
+                                    ):
+                                        logger.warning(
+                                            "Model ended its turn after question_completed without "
+                                            "continuing (no next question, no end_call); forcing continuation."
+                                        )
+                                        await openai_ws.send(json.dumps({"type": "response.create"}))
+                                asyncio.create_task(_continue_if_stalled())
+
                             else:
                                 # Unknown/irrelevant tool for this mode — still must
                                 # acknowledge it or the model's turn stalls waiting
@@ -501,6 +583,33 @@ async def handle_voice_bridge_ws(websocket, details: dict, end_call_callback=Non
                                 await _tool_output({"status": "ignored"})
 
                         elif event_type == "response.done":
+                            ai_responding = False
+                            # Start (or restart) the "waiting for the
+                            # candidate" clock for the silence watchdog below
+                            # every time the AI finishes a turn -- including a
+                            # silence nudge itself, so a candidate who's still
+                            # not responding gets checked on again rather than
+                            # only once for the whole call.
+                            waiting_since["value"] = time.monotonic()
+                            silence_nudge_sent = False
+
+                        elif event_type == "error":
+                            # Previously unhandled: a rejected/failed response
+                            # (e.g. "conversation_already_has_active_response"
+                            # from an explicit response.create racing a VAD-
+                            # triggered one) silently fell through every elif
+                            # above. If that happened while ai_responding was
+                            # still True from an earlier response that never
+                            # reached response.done, it stayed stuck True
+                            # forever -- and the speaking_status handler below
+                            # treats "ai_responding" as "there's a live
+                            # response to cancel," clearing the candidate's
+                            # input_audio_buffer every time they start talking
+                            # from then on, which looks exactly like "the AI
+                            # just stopped responding to anything." Always
+                            # reset it here so one failed response can't
+                            # permanently wedge the rest of the call.
+                            logger.error(f"Realtime API error event: {data.get('error', data)}")
                             ai_responding = False
                 except asyncio.CancelledError:
                     pass
@@ -546,7 +655,18 @@ async def handle_voice_bridge_ws(websocket, details: dict, end_call_callback=Non
 
             async def watch_for_forced_hangup():
                 await end_call_event.wait()
-                await asyncio.sleep(3)  # let any closing remarks finish streaming to the candidate
+                # The end_call tool call can be parsed before the same turn's
+                # closing-remarks audio has finished streaming (function-call
+                # and audio deltas are separate items within one response),
+                # so wait for that response to actually finish (ai_responding
+                # goes False on response.done) instead of guessing a fixed
+                # delay long enough for any closing statement. Capped so a
+                # missing/stuck response.done can't hang the call forever.
+                waited = 0.0
+                while ai_responding and waited < 15.0:
+                    await asyncio.sleep(0.2)
+                    waited += 0.2
+                await asyncio.sleep(1.5)  # buffer for downstream Teams audio playback latency
                 if module2_mode:
                     await _transition("CLOSING", "call ending")
                     _log_event("INTERVIEW_COMPLETED")
@@ -557,9 +677,40 @@ async def handle_voice_bridge_ws(websocket, details: dict, end_call_callback=Non
                         logger.error(f"Teams hangup callback failed: {e}")
                 await websocket.close()
 
+            async def watch_for_candidate_silence():
+                nonlocal silence_nudge_sent
+                # Server VAD only invokes the model on a speech-then-silence
+                # transition -- if the candidate never speaks at all after a
+                # question, there's no turn boundary to trigger the model, so
+                # it can never "notice" the silence on its own no matter what
+                # the prompt says. This polls real wall-clock time instead.
+                while not end_call_event.is_set():
+                    await asyncio.sleep(2)
+                    started = waiting_since["value"]
+                    if started is None or ai_responding or silence_nudge_sent:
+                        continue
+                    if time.monotonic() - started >= SILENCE_REPROMPT_SECONDS:
+                        silence_nudge_sent = True
+                        logger.info("Candidate has been silent for a while; nudging for a check-in.")
+                        base_instructions = build_module2_instructions(details) if module2_mode else build_instructions(details)
+                        await openai_ws.send(json.dumps({
+                            "type": "session.update",
+                            "session": {
+                                "type": "realtime",
+                                "instructions": base_instructions + (
+                                    "\n\nNOTE: The candidate has been silent for a while since your "
+                                    "last question. Gently check in -- ask if they're still there, or "
+                                    "if they'd like you to repeat or rephrase the question -- then wait "
+                                    "for their response."
+                                ),
+                            }
+                        }))
+                        await openai_ws.send(json.dumps({"type": "response.create"}))
+
             response_task = asyncio.create_task(handle_openai_responses())
             timer_task = asyncio.create_task(run_interview_timer())
             hangup_task = asyncio.create_task(watch_for_forced_hangup())
+            silence_task = asyncio.create_task(watch_for_candidate_silence())
 
             try:
                 async for message in websocket:
@@ -573,11 +724,23 @@ async def handle_voice_bridge_ws(websocket, details: dict, end_call_callback=Non
                                     await _transition("AUDIO_CHECK", "candidate speech detected; starting audio check")
                                 await openai_ws.send(json.dumps({"type": "response.create"}))
                         elif data.get("type") == "speaking_status" and data.get("speaking", False):
+                            # The candidate is actually talking now -- stop
+                            # waiting/watching for silence until the AI's next turn.
+                            waiting_since["value"] = None
+                            silence_nudge_sent = False
                             if ai_responding:
                                 await openai_ws.send(json.dumps({"type": "response.cancel"}))
                                 await websocket.send(json.dumps({"type": "stop_audio"}))
                                 ai_responding = False
                                 await openai_ws.send(json.dumps({"type": "input_audio_buffer.clear"}))
+                        elif data.get("type") == "video_status":
+                            enabled = bool(data.get("enabled"))
+                            if enabled:
+                                candidate_video_on = True
+                                video_prompt_sent = False
+                            elif candidate_video_on:
+                                candidate_video_on = False
+                                asyncio.create_task(prompt_video_on_if_still_off())
 
                     elif isinstance(message, bytes):
                         await openai_ws.send(json.dumps({
@@ -588,7 +751,8 @@ async def handle_voice_bridge_ws(websocket, details: dict, end_call_callback=Non
                 response_task.cancel()
                 timer_task.cancel()
                 hangup_task.cancel()
-                await asyncio.gather(response_task, timer_task, hangup_task, return_exceptions=True)
+                silence_task.cancel()
+                await asyncio.gather(response_task, timer_task, hangup_task, silence_task, return_exceptions=True)
                 # Local-disk transcript persistence (save_session_to_disk) was removed --
                 # doesn't survive a container restart/redeploy the way a DB row does.
                 # Module 2 sessions get the full transcript written to

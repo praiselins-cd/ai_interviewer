@@ -12,7 +12,7 @@ from playwright_stealth import Stealth
 from app.config import get_settings
 from app.realtime.connection import handle_voice_bridge_ws
 # IMPORT THE NEW LEAVE FUNCTION HERE
-from app.bot.teams import do_teams_join, leave_teams_call, admit_from_lobby, set_role
+from app.bot.teams import do_teams_join, leave_teams_call, admit_from_lobby, start_recording, set_role
 from app.infra.lock import held_lock, extend_lock
 
 logger = logging.getLogger(__name__)
@@ -20,6 +20,15 @@ settings = get_settings()
 
 BASE_DIR = Path(__file__).parent
 SIGNED_IN_PROFILE_DIR = BASE_DIR / "browser_profile"
+ADMITTER_STATE_FILE = BASE_DIR / "admitter_state.json"
+
+_CONTEXT_KWARGS = dict(
+    permissions=["camera", "microphone"],
+    viewport={"width": 1440, "height": 900},
+    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+    ignore_https_errors=True,
+)
 
 # The signed-in identity can only be in one meeting at a time. This is a
 # Redis-backed distributed lock (not asyncio.Lock) because each interview now
@@ -195,7 +204,7 @@ async def launch_bot(
 
         context = await p.chromium.launch_persistent_context(
             str(profile_dir),
-            headless=True,
+            headless=settings.browser_headless,
             **_browser_launch_channel_kwargs(),
             args=BROWSER_ARGS,
             permissions=["camera", "microphone"],
@@ -298,7 +307,7 @@ async def _run_admitter_session(meeting_url: str, ready_event: asyncio.Event | N
     async with async_playwright() as p:
         context = await p.chromium.launch_persistent_context(
             str(SIGNED_IN_PROFILE_DIR),
-            headless=True,
+            headless=settings.browser_headless,
             **_browser_launch_channel_kwargs(),
             args=BROWSER_ARGS,
             permissions=["camera", "microphone"],
@@ -334,3 +343,151 @@ async def _run_admitter_session(meeting_url: str, ready_event: asyncio.Event | N
             if not left:
                 log.error("Admitter could not confirm it left the meeting.")
             await context.close()
+
+
+async def launch_admitter_and_guest(
+    meeting_url: str, details: dict, admitter_ready: asyncio.Event | None = None
+) -> None:
+    """Runs the admitter and guest as two tabs (BrowserContexts) inside a
+    single shared browser process, instead of launch_admitter() and
+    launch_bot(join_mode="guest") each launching their own separate browser.
+    The admitter's tab opens first using its saved signed-in session
+    (ADMITTER_STATE_FILE); once it has joined the meeting, a second tab opens
+    for the anonymous guest, which the admitter then admits from the lobby.
+    """
+    log = logging.getLogger("app.bot.engine")
+    ready_event = admitter_ready if admitter_ready is not None else asyncio.Event()
+
+    try:
+        async with held_lock(ADMITTER_IDENTITY_LOCK, ttl_ms=45000) as token:
+            renew_task = asyncio.create_task(_renew_admitter_lock(token, log))
+            try:
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(
+                        headless=settings.browser_headless,
+                        **_browser_launch_channel_kwargs(),
+                        args=BROWSER_ARGS,
+                    )
+                    try:
+                        await asyncio.gather(
+                            _run_admitter_tab(browser, meeting_url, ready_event),
+                            _run_guest_tab(browser, meeting_url, details, ready_event),
+                        )
+                    finally:
+                        await browser.close()
+            finally:
+                renew_task.cancel()
+    except TimeoutError:
+        log.warning("Admitter identity is busy (locked by another interview); skipping this attempt.")
+
+
+async def _run_admitter_tab(browser, meeting_url: str, ready_event: asyncio.Event) -> None:
+    set_role("admitter")
+    log = logging.getLogger("app.bot.admitter")
+    log.info(f"Admitter: joining {meeting_url} to admit the guest bot.")
+
+    context = await browser.new_context(storage_state=str(ADMITTER_STATE_FILE), **_CONTEXT_KWARGS)
+    await _block_external_app_launch(context, log)
+    page = await context.new_page()
+    page.on("console", lambda msg: log.info(f"[ADMITTER BROWSER] {msg.text}"))
+    page.on("pageerror", lambda exc: log.error(f"[ADMITTER BROWSER ERROR] {exc}"))
+    page.on("dialog", lambda dialog: asyncio.create_task(dialog.dismiss()))
+    try:
+        # Deliberately no interceptor.js / custom_audio_payload.js and no
+        # connection to the realtime voice bridge here — the admitter's only
+        # job is join -> admit -> confirm -> leave.
+        await Stealth().apply_stealth_async(page)
+        await page.goto(meeting_url, wait_until="domcontentloaded")
+        await do_teams_join(page)
+        if not await start_recording(page):
+            log.warning("Proceeding without confirmed recording.")
+        ready_event.set()
+        log.info("Admitter joined successfully; guest bot may now start.")
+        admitted = await admit_from_lobby(page)
+        if not admitted:
+            log.warning("Admitter never saw a lobby prompt or couldn't confirm the guest joined.")
+    except Exception as e:
+        log.error(f"Admitter session failed: {e}")
+    finally:
+        left = await leave_teams_call(page, confirm=True)
+        if not left:
+            log.error("Admitter could not confirm it left the meeting.")
+        await context.close()
+
+
+async def _run_guest_tab(browser, meeting_url: str, details: dict, admitter_ready: asyncio.Event) -> None:
+    set_role("guest")
+    log = logging.getLogger("app.bot.guest")
+
+    log.info("Guest bot waiting for admitter to join the meeting first.")
+    try:
+        # See launch_bot()'s matching wait for why this is 150s, not 60s.
+        await asyncio.wait_for(admitter_ready.wait(), timeout=150)
+        log.info("Admitter is ready; starting guest bot join.")
+    except asyncio.TimeoutError:
+        log.error("Admitter did not become ready within 150 seconds; guest bot will not join.")
+        return
+
+    stop_event = asyncio.Event()
+    page_ref = {"page": None}
+
+    async def end_call_action():
+        if page_ref["page"]:
+            await leave_teams_call(page_ref["page"])
+        else:
+            log.error("end_call_action triggered, but browser page is not active.")
+
+    bound_port = {"value": None}
+
+    async def start_server():
+        async with websockets.serve(
+            lambda ws: handle_voice_bridge_ws(ws, details, end_call_callback=end_call_action),
+            settings.websocket_host,
+            0,
+        ) as server:
+            bound_port["value"] = server.sockets[0].getsockname()[1]
+            await stop_event.wait()
+
+    server_task = asyncio.create_task(start_server())
+    while bound_port["value"] is None:
+        await asyncio.sleep(0.05)
+    log.info(f"Voice bridge bound to port {bound_port['value']}")
+
+    with open(BASE_DIR / "scripts" / "interceptor.js", "r", encoding="utf-8") as f:
+        interceptor_js = f.read()
+    with open(BASE_DIR / "scripts" / "custom_audio_payload.js", "r", encoding="utf-8") as f:
+        custom_audio_js = f.read()
+    with open(BASE_DIR / "scripts" / "stealth_injection.js", "r", encoding="utf-8") as f:
+        stealth_js = f.read()
+
+    context = await browser.new_context(**_CONTEXT_KWARGS)
+    await _block_external_app_launch(context, log)
+
+    page = context.pages[0] if context.pages else await context.new_page()
+    page_ref["page"] = page
+
+    page.on("console", lambda msg: log.info(f"[BROWSER] {msg.text}"))
+    page.on("pageerror", lambda exc: log.error(f"[BROWSER ERROR] {exc}"))
+    page.on("dialog", lambda dialog: asyncio.create_task(dialog.dismiss()))
+
+    try:
+        await Stealth().apply_stealth_async(page)
+        await page.add_init_script(stealth_js)
+        await page.add_init_script(interceptor_js)
+        log.info(f"Navigating to Teams Room Link: {meeting_url}")
+        await page.goto(meeting_url, wait_until="domcontentloaded")
+
+        await do_teams_join(page)
+
+        await page.evaluate(f"window.__VOICE_BRIDGE_PORT__ = {bound_port['value']};")
+        await page.evaluate(custom_audio_js)
+        log.info("Custom audio stream pipeline active. Waiting for meeting close...")
+
+        await page.wait_for_event("close", timeout=0)
+
+    except asyncio.CancelledError:
+        log.info("Bot worker task received interrupt signal termination.")
+    finally:
+        stop_event.set()
+        await context.close()
+        await server_task

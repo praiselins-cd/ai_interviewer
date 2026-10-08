@@ -7,12 +7,6 @@ class Settings(BaseSettings):
     realtimeapi_azure_openai_deployment_model_name: str
     realtimeapi_azure_openai_service_key: str
 
-    # Chat Completion Model (Evaluator) -- optional: the evaluator module is
-    # being rebuilt and isn't wired into startup right now.
-    azure_openai_chat_endpoint: str = ""
-    azure_openai_chat_key: str = ""
-    azure_openai_chat_deployment_model_name: str = ""
-
     # Base Web Server Options
     bot_name: str = "Proxy AI Interviewer"
     websocket_host: str = "localhost"
@@ -61,6 +55,11 @@ class Settings(BaseSettings):
     # still hold on plain Chromium, ahead of a Linux/Docker deploy where
     # bundled Chromium is far simpler to provision than real Chrome.
     browser_executable_path: str = ""
+
+    # Set to false to run with a visible browser window (useful when
+    # debugging the admitter/guest join flow locally); defaults to true
+    # (headless) for normal/deployed operation.
+    browser_headless: bool = True
 
     model_config = SettingsConfigDict(
         env_file=".env",

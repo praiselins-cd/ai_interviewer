@@ -396,6 +396,68 @@ async def _admit_via_context_menu(page: Page, row, display_name: str = GUEST_DIS
         return False
 
 
+async def start_recording(page: Page) -> bool:
+    """Best-effort: opens Teams' "More actions" menu and starts cloud
+    recording. Teams records at the meeting level, so it keeps recording
+    after the admitter later leaves -- this only needs to be clicked once,
+    by the admitter, before admitting the guest. Selectors here are
+    unverified against a live Teams build (unlike the join/admit flow
+    above); any failure is logged and swallowed -- never fatal to the
+    interview, since the caller treats recording as optional.
+    """
+    try:
+        # Tried in order: a visible-text match on the toolbar's "More" label
+        # (confirmed from a live screenshot) first, then looser aria-label/id
+        # fallbacks in case the text match misses on a different Teams build.
+        more_btn = None
+        for selector in (
+            'button:text-is("More")',
+            'button[aria-label="More" i]',
+            'button[aria-label*="More" i]',
+            'button[id*="more-btn" i]',
+        ):
+            _, more_btn = await _find_across_frames(page, selector, timeout_ms=5000)
+            if more_btn is not None:
+                _log().info(f"Found the More actions button via selector: {selector}")
+                break
+        if more_btn is None:
+            _log().warning("Could not find the More actions button; skipping recording.")
+            return False
+        await more_btn.click(timeout=5000)
+        await _settle(page)
+
+        # Current Teams groups this under a "Record and transcribe" flyout
+        # submenu, itself containing "Start recording" / "Start transcription".
+        _, submenu = await _find_across_frames(page, 'text="Record and transcribe"', timeout_ms=5000)
+        if submenu is not None:
+            await submenu.click(timeout=5000)
+            await _settle(page)
+
+        _, start_item = await _find_across_frames(page, 'text="Start recording"', timeout_ms=5000)
+        if start_item is None:
+            _log().warning("Could not find 'Start recording' menu item; skipping recording.")
+            return False
+        await start_item.click(timeout=5000)
+        await _settle(page)
+
+        # Clicking "Start recording" opens a "Start recording and
+        # transcription" dialog (language picker + "Choose what to record",
+        # already defaulted to "Video and audio") with a "Confirm" button.
+        _, confirm_btn = await _find_across_frames(page, 'button:has-text("Confirm")', timeout_ms=5000)
+        if confirm_btn is not None:
+            await confirm_btn.click(timeout=5000)
+            await _settle(page)
+        else:
+            _log().warning("Start-recording confirmation dialog's Confirm button was not found.")
+
+        _log().info("Recording start sequence completed.")
+        return True
+    except Exception as e:
+        _log().warning(f"Could not start recording: {e}")
+        await _save_debug_snapshot(page, "start_recording_failed")
+        return False
+
+
 async def admit_from_lobby(page: Page, timeout_ms: int = 120000, display_name: str = GUEST_DISPLAY_NAME) -> bool:
     """Opens the People panel, finds a waiting participant's row under
     Waiting in lobby by their display name, and admits them. `display_name`

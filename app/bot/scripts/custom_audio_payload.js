@@ -248,6 +248,41 @@
         console.log('[AudioPayload] Intercepted HTMLMediaElement.prototype.srcObject');
     }
 
+    // Tracks whether the candidate's camera appears to be on, reported to
+    // the Python backend so it can ask them to turn it on if it's off (see
+    // the "video_status" handling in connection.py). Starts true so we never
+    // prompt before any <video> element has even shown up yet.
+    let lastVideoOnState = true;
+
+    function checkVideoStatus() {
+        let anyVideoOn = false;
+        let videoElementCount = 0;
+        const trackDebug = [];
+        findMediaElements(document.body).forEach(el => {
+            if (el.tagName !== 'VIDEO') return;
+            videoElementCount++;
+            if (!el.srcObject) return;
+            const videoTracks = el.srcObject.getVideoTracks ? el.srcObject.getVideoTracks() : [];
+            videoTracks.forEach(track => {
+                trackDebug.push(`readyState=${track.readyState},enabled=${track.enabled},muted=${track.muted}`);
+                if (track.readyState === 'live' && track.enabled !== false) anyVideoOn = true;
+            });
+        });
+        // Unverified against a live Teams build yet -- logged every poll
+        // (not just on change) so the first real test tells us whether Teams
+        // actually represents remote camera-off this way (track.enabled or
+        // readyState changing) or some other way entirely (e.g. no <video>
+        // element at all, or the track staying "live"/enabled regardless).
+        console.log(`[AudioPayload] [VIDEO CHECK] videoElements=${videoElementCount} tracks=[${trackDebug.join(' | ') || 'none'}] anyVideoOn=${anyVideoOn}`);
+        if (anyVideoOn !== lastVideoOnState) {
+            lastVideoOnState = anyVideoOn;
+            if (socket.readyState === WebSocket.OPEN) {
+                socket.send(JSON.stringify({ type: 'video_status', enabled: anyVideoOn }));
+                console.log('[AudioPayload] Video status changed:', anyVideoOn ? 'ON' : 'OFF');
+            }
+        }
+    }
+
     // Initial scan and continuous scan for new participants targeting Shadow DOMs
     setInterval(() => {
         // Read raw streams hijacked by the Python interceptor script
@@ -262,6 +297,8 @@
         findMediaElements(document.body).forEach(el => {
             if (el.srcObject) connectMediaStream(el.srcObject);
         });
+
+        checkVideoStatus();
     }, 2000);
 
     startCaptureLoop();

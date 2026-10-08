@@ -5,7 +5,6 @@ from fastapi import APIRouter, HTTPException
 from app.api.models import InterviewStartRequest
 from app.state import machine as state_machine
 from app.scheduling.scheduler import schedule_interview
-# from app.api.evaluation_routes import router as evaluation_router
 logger = logging.getLogger(__name__)
 router = APIRouter()
 

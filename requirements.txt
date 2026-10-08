@@ -2,7 +2,6 @@ playwright==1.63.0
 playwright-stealth
 websockets
 python-dotenv
-openai
 google-api-python-client
 google-auth
 google-auth-oauthlib
