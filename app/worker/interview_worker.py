@@ -18,9 +18,29 @@ from app.bot.engine import launch_bot, launch_admitter_and_guest
 from app.state import machine as state_machine
 from app.state.machine import InterviewState
 from app.scheduling.capacity import mark_inactive
+from app.repositories.ai_interview_repo import (
+    get_ai_interview_by_redis_id,
+    release_reservation_for_ai_interview,
+    update_ai_interview_status,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("app.worker")
+
+
+async def _mirror_status_to_postgres(interview_id: str, status: str) -> None:
+    """Postgres's ai_interviews.status is a separate record from the Redis
+    state machine and nothing previously wrote the terminal Redis states
+    (COMPLETED/FAILED) back into it -- GET /v1/ai-interviews/{id} would stay
+    stuck on whatever status it had before the interview ran. Best-effort:
+    never allowed to crash the worker or mask the real outcome, which is
+    already recorded in Redis regardless of whether this mirror succeeds."""
+    try:
+        ai_interview = await get_ai_interview_by_redis_id(interview_id)
+        if ai_interview:
+            await update_ai_interview_status(ai_interview["id"], status)
+    except Exception as e:
+        logger.warning(f"Could not mirror status '{status}' to Postgres: {e}")
 
 
 async def _heartbeat_loop(interview_id: str, stop_event: asyncio.Event) -> None:
@@ -107,12 +127,14 @@ async def run(interview_id: str, meeting_url: str, join_mode: str, details: dict
                 interview_id, InterviewState.FINALISING_TRANSCRIPT, reason="wrapping up transcript"
             )
             await state_machine.transition(interview_id, InterviewState.COMPLETED, reason="worker finished cleanly")
+            await _mirror_status_to_postgres(interview_id, InterviewState.COMPLETED.value)
     except Exception as e:
         logger.exception("Worker failed")
         try:
             await state_machine.transition(interview_id, InterviewState.FAILED, reason=str(e))
         except Exception:
             logger.error("Could not record FAILED state either.")
+        await _mirror_status_to_postgres(interview_id, InterviewState.FAILED.value)
     finally:
         stop_hb.set()
         hb_task.cancel()
@@ -126,7 +148,6 @@ async def run(interview_id: str, meeting_url: str, join_mode: str, details: dict
         # since the reservation's time window can still be in the future
         # relative to "now" even though this interview is already done.
         try:
-            from app.repositories.ai_interview_repo import get_ai_interview_by_redis_id, release_reservation_for_ai_interview
             ai_interview = await get_ai_interview_by_redis_id(interview_id)
             if ai_interview:
                 await release_reservation_for_ai_interview(ai_interview["id"])

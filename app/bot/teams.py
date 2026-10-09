@@ -118,6 +118,58 @@ async def _dismiss_native_app_launch_prompt(page: Page) -> None:
         await asyncio.sleep(0.5)
 
 
+async def _ensure_camera_on(page: Page) -> None:
+    """Best-effort: turns the camera toggle on during the pre-join "green
+    room" screen if it's found off. Nothing in this flow ever did this
+    before -- the bot was joining with its camera left at whatever Teams
+    defaults a fresh/incognito session to (commonly off, regardless of the
+    camera permission already being granted), which is why the guest's
+    video tile stayed black even once the fake canvas video track itself
+    was confirmed working. Selectors here are unverified against a live
+    Teams build (same category as the recording-menu selectors) -- never
+    fatal, logs what it finds either way so a miss can be diagnosed from
+    the logs instead of guessed at again.
+    """
+    try:
+        candidates = [
+            'button[aria-label*="camera" i]',
+            '[data-tid="toggle-video"]',
+            'button[data-tid*="camera" i]',
+        ]
+        cam_btn = None
+        matched_selector = None
+        for selector in candidates:
+            loc = page.locator(selector).first
+            if await loc.count() > 0:
+                cam_btn = loc
+                matched_selector = selector
+                break
+        if cam_btn is None:
+            _log().warning(f"Camera toggle not found on pre-join screen (tried: {candidates}); leaving camera as-is.")
+            return
+
+        aria_label = await cam_btn.get_attribute("aria-label")
+        aria_pressed = await cam_btn.get_attribute("aria-pressed")
+        _log().info(
+            f"Camera toggle found via '{matched_selector}': aria-label={aria_label!r}, aria-pressed={aria_pressed!r}"
+        )
+
+        # Teams labels this button with the action it would perform, so
+        # aria-label containing "turn camera on" means it's currently OFF.
+        # aria-pressed="false" is the same signal via a different attribute,
+        # depending on the Teams build -- check both, since which one is
+        # actually present is exactly what's unverified here.
+        is_off = (aria_label and "on" in aria_label.lower()) or aria_pressed == "false"
+        if is_off:
+            await cam_btn.click(timeout=5000)
+            await _settle(page)
+            _log().info("Clicked the camera toggle to turn it on.")
+        else:
+            _log().info("Camera toggle appears to already be on; leaving it as-is.")
+    except Exception as e:
+        _log().warning(f"Could not confirm/enable the camera toggle: {e}")
+
+
 async def do_teams_join(page: Page) -> None:
     name_input_selector = 'input[placeholder*="name" i], input[type="text"]'
     join_btn_selector = 'button:has-text("Join now")'
@@ -195,6 +247,8 @@ async def do_teams_join(page: Page) -> None:
     except Exception as e:
         _log().info(f"Teams UI: no anonymous name field was available; using signed-in join flow: {e}")
 
+    await _ensure_camera_on(page)
+
     # 3. Enter lobby queue, with a confirmed retry in case the first click
     # landed before the button was truly interactive.
     join_dispatched = False
@@ -232,52 +286,39 @@ async def do_teams_join(page: Page) -> None:
         await page.wait_for_timeout(5000)
 
 
-async def _count_other_participants(page: Page) -> int:
-    """Best-effort read of how many participants (besides the admitter itself)
-    are currently in the call, via the People/roster panel badge count."""
-    try:
-        roster_btn = page.locator(
-            'button[aria-label*="People" i], [data-tid="roster-button"]'
-        ).first
-        if await roster_btn.count() == 0:
-            return -1
-        aria_label = await roster_btn.get_attribute("aria-label")
-        if not aria_label:
-            return -1
-        import re
-        match = re.search(r"\((\d+)\)", aria_label)
-        if not match:
-            return -1
-        # Roster count includes the admitter itself, so subtract 1.
-        return max(0, int(match.group(1)) - 1)
-    except Exception:
-        return -1
+async def wait_for_guest_to_actually_join(
+    page: Page, display_name: str = GUEST_DISPLAY_NAME, timeout_s: int = 15, poll_interval_s: float = 1.0
+) -> bool:
+    """Confirms the guest is actually in the meeting (not just admitted from
+    the lobby) before the admitter leaves, using the People panel that
+    admit_from_lobby already has open: polls until the "Waiting in lobby"
+    heading is gone (nobody left waiting) while the guest's name is still
+    present somewhere on the page (they exist, as opposed to the list just
+    emptying because they disconnected). Reuses _find_across_frames like
+    every other check in this file -- no new selectors.
 
-
-async def wait_for_guest_to_actually_join(page: Page, timeout_s: int = 40, poll_interval_s: float = 1.0) -> bool:
-    """Polls the participant roster until someone besides the admitter is
-    actually in the call (not just admitted from the lobby), so the admitter
-    doesn't leave while the guest is still mid-transition. Falls back to a
-    short buffer wait if the roster count can't be read reliably.
-
-    Polls every ~1s (was 2s) so a genuinely-fast join is detected and the
-    admitter leaves promptly -- the earlier 2s cadence plus a flat 10s
-    fallback sleep on top of that could add up to a noticeably slow exit
-    even in the success case. The fallback (roster count never became
-    readable) is now a short 3s pause, not 10s -- it was providing no real
-    benefit at 10s, just delay, once polling has already given up."""
+    Previously used a roster-badge aria-label regex count instead, which
+    silently returned "unknown" for the whole 40s timeout whenever the real
+    aria-label text didn't match the expected "(N)" pattern, leaving the
+    admitter sitting in the meeting for ~43s after the guest had already
+    visibly joined. This check only needs what's already proven to render:
+    the same "Waiting in lobby" text admit_from_lobby just searched for.
+    """
     _log().info("Confirming guest has actually joined before admitter leaves...")
+    waiting_heading_selector = 'text=Waiting in lobby'
+    name_selector = f'text={display_name}'
     attempts = max(1, int(timeout_s / poll_interval_s))
     for i in range(attempts):
-        count = await _count_other_participants(page)
-        if count >= 1:
-            _log().info(f"Confirmed {count} other participant(s) in the call after {i * poll_interval_s:.1f}s.")
+        _, waiting_heading = await _find_across_frames(page, waiting_heading_selector, timeout_ms=0)
+        _, name_match = await _find_across_frames(page, name_selector, timeout_ms=0)
+        if waiting_heading is None and name_match is not None:
+            _log().info(f"Confirmed guest is in the meeting (not waiting) after {i * poll_interval_s:.1f}s.")
             return True
         if i % 5 == 0:
-            _log().info(f"Still waiting for guest to join (roster count check #{i}, elapsed {i * poll_interval_s:.1f}s)...")
+            _log().info(f"Still waiting for guest to join (check #{i}, elapsed {i * poll_interval_s:.1f}s)...")
         await asyncio.sleep(poll_interval_s)
 
-    _log().warning("Could not confirm guest joined via roster count; using short fallback buffer wait.")
+    _log().warning("Could not confirm guest joined via the People panel; using short fallback buffer wait.")
     await asyncio.sleep(3)
     return False
 

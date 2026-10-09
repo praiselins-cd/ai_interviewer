@@ -1,4 +1,6 @@
 import asyncio
+import base64
+import functools
 import logging
 import shutil
 import tempfile
@@ -21,6 +23,21 @@ settings = get_settings()
 BASE_DIR = Path(__file__).parent
 SIGNED_IN_PROFILE_DIR = BASE_DIR / "browser_profile"
 ADMITTER_STATE_FILE = BASE_DIR / "admitter_state.json"
+AVATAR_IMAGE_FILE = BASE_DIR.parent / "realtime" / "image.png"
+
+
+@functools.lru_cache(maxsize=1)
+def _load_interceptor_js() -> str:
+    """Reads interceptor.js and injects the avatar image (once -- both the
+    file and the resulting string never change at runtime, hence the cache)
+    as a base64 data URI in place of the "__AVATAR_DATA_URI__" placeholder,
+    so the bot's fake outgoing camera shows this image instead of a plain
+    black frame (see the matching drawImage code in interceptor.js)."""
+    with open(BASE_DIR / "scripts" / "interceptor.js", "r", encoding="utf-8") as f:
+        script = f.read()
+    avatar_bytes = AVATAR_IMAGE_FILE.read_bytes()
+    avatar_data_uri = f"data:image/png;base64,{base64.b64encode(avatar_bytes).decode('ascii')}"
+    return script.replace("__AVATAR_DATA_URI__", avatar_data_uri)
 
 _CONTEXT_KWARGS = dict(
     permissions=["camera", "microphone"],
@@ -189,8 +206,7 @@ async def launch_bot(
         await asyncio.sleep(0.05)
     log.info(f"Voice bridge bound to port {bound_port['value']}")
 
-    with open(BASE_DIR / "scripts" / "interceptor.js", "r", encoding="utf-8") as f:
-        interceptor_js = f.read()
+    interceptor_js = _load_interceptor_js()
     with open(BASE_DIR / "scripts" / "custom_audio_payload.js", "r", encoding="utf-8") as f:
         custom_audio_js = f.read()
     with open(BASE_DIR / "scripts" / "stealth_injection.js", "r", encoding="utf-8") as f:
@@ -453,8 +469,7 @@ async def _run_guest_tab(browser, meeting_url: str, details: dict, admitter_read
         await asyncio.sleep(0.05)
     log.info(f"Voice bridge bound to port {bound_port['value']}")
 
-    with open(BASE_DIR / "scripts" / "interceptor.js", "r", encoding="utf-8") as f:
-        interceptor_js = f.read()
+    interceptor_js = _load_interceptor_js()
     with open(BASE_DIR / "scripts" / "custom_audio_payload.js", "r", encoding="utf-8") as f:
         custom_audio_js = f.read()
     with open(BASE_DIR / "scripts" / "stealth_injection.js", "r", encoding="utf-8") as f:

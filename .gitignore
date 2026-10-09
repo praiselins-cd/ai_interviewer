@@ -20,3 +20,4 @@ app/bot/debug_snapshots/
 
 # Office lock files
 ~$*.docx
+app/bot/admitter_state.json
