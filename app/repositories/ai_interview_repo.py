@@ -5,7 +5,9 @@ constantly). No ORM: plain parameterized SQL. The DDL these functions assume liv
 in the plan doc (C:\\Users\\PraiselinSG\\.claude\\plans\\is-it-a-proper-spicy-melody.md)
 and must be run against Postgres by hand before this module is used.
 """
+import asyncio
 import json
+from collections import defaultdict
 from datetime import datetime, timezone
 from uuid import UUID
 
@@ -221,6 +223,90 @@ async def mark_session_ended(session_id: UUID) -> None:
     )
 
 
+LLM_USAGE_DDL = """
+CREATE TABLE IF NOT EXISTS ai_interviewer_llm_usage (
+    id                        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    interview_session_id      UUID,
+    assessment_plan_id        UUID,
+    organization_id           INTEGER,
+    service                  VARCHAR(50)  NOT NULL,
+    call_label                VARCHAR(100),
+    entity_id                 UUID,
+    model_name                VARCHAR(200),
+    input_token_count         INTEGER,
+    output_token_count        INTEGER,
+    input_speech_token_count  INTEGER,
+    input_text_token_count    INTEGER,
+    output_speech_token_count INTEGER,
+    output_text_token_count   INTEGER,
+    cost_usd                  NUMERIC(10, 6),
+    duration_ms               INTEGER,
+    avg_response_latency_ms   INTEGER,
+    max_response_latency_ms   INTEGER,
+    connection_count          INTEGER,
+    created_at                TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+-- CREATE TABLE IF NOT EXISTS skips an existing table, so columns added
+-- later must also be added here to reach databases that already have it.
+ALTER TABLE ai_interviewer_llm_usage ADD COLUMN IF NOT EXISTS assessment_plan_id UUID;
+ALTER TABLE ai_interviewer_llm_usage ADD COLUMN IF NOT EXISTS organization_id INTEGER;
+CREATE INDEX IF NOT EXISTS idx_ai_interviewer_llm_usage_session ON ai_interviewer_llm_usage (interview_session_id);
+CREATE INDEX IF NOT EXISTS idx_ai_interviewer_llm_usage_plan    ON ai_interviewer_llm_usage (assessment_plan_id);
+CREATE INDEX IF NOT EXISTS idx_ai_interviewer_llm_usage_entity  ON ai_interviewer_llm_usage (entity_id);
+CREATE INDEX IF NOT EXISTS idx_ai_interviewer_llm_usage_org     ON ai_interviewer_llm_usage (organization_id);
+"""
+
+
+async def ensure_llm_usage_table() -> None:
+    """Creates the shared ai_interviewer_llm_usage table if it's missing.
+    Also written to by cd-ats-ai-service (planner/evaluator), so any column
+    change must be mirrored there as ADD COLUMN IF NOT EXISTS."""
+    pool = await get_pool()
+    await pool.execute(LLM_USAGE_DDL)
+
+
+async def insert_llm_usage(
+    *,
+    interview_session_id: UUID | None,
+    service: str,
+    call_label: str | None,
+    entity_id: UUID | None,
+    model_name: str | None,
+    input_token_count: int | None,
+    output_token_count: int | None,
+    input_speech_token_count: int | None = None,
+    input_text_token_count: int | None = None,
+    output_speech_token_count: int | None = None,
+    output_text_token_count: int | None = None,
+    cost_usd: float | None = None,
+    duration_ms: int | None = None,
+    avg_response_latency_ms: int | None = None,
+    max_response_latency_ms: int | None = None,
+    connection_count: int | None = None,
+    assessment_plan_id: UUID | None = None,
+    organization_id: int | None = None,
+) -> None:
+    pool = await get_pool()
+    await pool.execute(
+        """
+        INSERT INTO ai_interviewer_llm_usage
+            (interview_session_id, service, call_label, entity_id, model_name,
+             input_token_count, output_token_count,
+             input_speech_token_count, input_text_token_count,
+             output_speech_token_count, output_text_token_count,
+             cost_usd, duration_ms, avg_response_latency_ms, max_response_latency_ms,
+             connection_count, assessment_plan_id, organization_id)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+        """,
+        interview_session_id, service, call_label, entity_id, model_name,
+        input_token_count, output_token_count,
+        input_speech_token_count, input_text_token_count,
+        output_speech_token_count, output_text_token_count,
+        cost_usd, duration_ms, avg_response_latency_ms, max_response_latency_ms,
+        connection_count, assessment_plan_id, organization_id,
+    )
+
+
 async def save_full_transcript(session_id: UUID, transcript: dict) -> None:
     """Stores the whole assembled transcript (see
     TranscriptSessionLogger.build_payload) on the session row -- replaces
@@ -283,6 +369,8 @@ async def finalise_session(session_id: UUID) -> bool:
 
 # ---- interview_transcript_turns ----------------------------------------------
 
+_transcript_locks: defaultdict[UUID, asyncio.Lock] = defaultdict(asyncio.Lock)
+
 async def next_sequence_number(session_id: UUID) -> int:
     pool = await get_pool()
     row = await pool.fetchrow(
@@ -303,18 +391,21 @@ async def insert_transcript_turn(
     transcription_confidence: float | None = None,
 ) -> UUID:
     pool = await get_pool()
-    seq = await next_sequence_number(session_id)
-    row = await pool.fetchrow(
-        """
-        INSERT INTO interview_transcript_turns
-            (ai_interview_session_id, question_id, speaker, sequence_number, started_at,
-             text, is_final, transcription_confidence)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        RETURNING id
-        """,
-        session_id, question_id, speaker, seq, started_at or datetime.now(timezone.utc),
-        text, is_final, transcription_confidence,
-    )
+    # Turns are inserted fire-and-forget, so two can race on MAX()+1; serialise
+    # per session so each gets a distinct sequence_number.
+    async with _transcript_locks[session_id]:
+        seq = await next_sequence_number(session_id)
+        row = await pool.fetchrow(
+            """
+            INSERT INTO interview_transcript_turns
+                (ai_interview_session_id, question_id, speaker, sequence_number, started_at,
+                 text, is_final, transcription_confidence)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            RETURNING id
+            """,
+            session_id, question_id, speaker, seq, started_at or datetime.now(timezone.utc),
+            text, is_final, transcription_confidence,
+        )
     return row["id"]
 
 

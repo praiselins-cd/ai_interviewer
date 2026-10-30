@@ -8,9 +8,29 @@
     socket.onerror = (e) => console.log('[AudioPayload] ❌ WebSocket error:', e);
     socket.onclose = (e) => console.log('[AudioPayload] 🔴 WebSocket closed. Code:', e.code, e.reason);
 
-    const virtualMicCtx = window.__virtualMicCtx; 
+    const virtualMicCtx = window.__virtualMicCtx;
     const gainNode = window.__virtualMicGainNode;
     let nextPlayTime = 0;
+    let receivedAudioChunks = 0;
+    const scheduledPlaybackSources = new Set();
+
+    // Capture gate: set to 0 while AI audio is playing so Teams' loopback of
+    // the AI's own voice doesn't get fed back to Nova Sonic as candidate speech.
+    const captureGateCtx = new AudioContext({ sampleRate: 16000 });
+    const captureGate = captureGateCtx.createGain();
+    captureGate.gain.value = 1.0;  // open by default; Python closes it during AI speech
+
+    function stopScheduledPlayback() {
+        for (const source of scheduledPlaybackSources) {
+            try {
+                source.stop();
+            } catch (e) {
+                console.debug('[AudioPayload] Playback source was already stopped:', e);
+            }
+        }
+        scheduledPlaybackSources.clear();
+        nextPlayTime = virtualMicCtx.currentTime;
+    }
     // Set default output volume to 0 (muting by default until Python validates the transcript)
     gainNode.gain.setValueAtTime(1, virtualMicCtx.currentTime);
 
@@ -33,12 +53,28 @@
                 return;
             }
             if (cmd.type === 'stop_audio') {
-                nextPlayTime = 0; 
-                console.log("[AudioPayload] AI Playback Interrupted.");
+                stopScheduledPlayback();
+                captureGate.gain.setValueAtTime(1.0, captureGateCtx.currentTime);
+                console.log("[AudioPayload] AI Playback Interrupted; capture reopened.");
+                return;
+            }
+            if (cmd.type === 'mute_capture') {
+                const vol = cmd.mute ? 0.0 : 1.0;
+                captureGate.gain.setValueAtTime(vol, captureGateCtx.currentTime);
+                console.log(`[AudioPayload] Capture gate ${cmd.mute ? 'closed' : 'opened'} (echo prevention).`);
                 return;
             }
         }
         if (event.data instanceof ArrayBuffer) {
+            if (receivedAudioChunks === 0) {
+                const track = window.__virtualMicTrack;
+                console.log(
+                    `[AudioPayload] First AI audio chunk received (${event.data.byteLength} bytes); `
+                    + `virtual mic state=${track ? track.readyState : 'missing'}, `
+                    + `enabled=${track ? track.enabled : 'n/a'}, gain=${gainNode.gain.value}.`
+                );
+            }
+            receivedAudioChunks++;
             const int16Data = new Int16Array(event.data);
             const float32Data = new Float32Array(int16Data.length);
             for (let i = 0; i < int16Data.length; i++) {
@@ -47,7 +83,16 @@
 
             if (virtualMicCtx.state !== 'running') {
                 console.log(`[AudioPayload] AudioContext not running (state=${virtualMicCtx.state}) when audio arrived; forcing resume.`);
-                await virtualMicCtx.resume();
+                try {
+                    await virtualMicCtx.resume();
+                } catch (e) {
+                    console.error('[AudioPayload] Failed to resume virtual mic AudioContext:', e);
+                    return;
+                }
+                if (virtualMicCtx.state !== 'running') {
+                    console.error(`[AudioPayload] Virtual mic AudioContext did not resume (state=${virtualMicCtx.state}).`);
+                    return;
+                }
             }
 
             const buffer = virtualMicCtx.createBuffer(1, float32Data.length, 24000);
@@ -56,6 +101,8 @@
             const source = virtualMicCtx.createBufferSource();
             source.buffer = buffer;
             source.connect(gainNode);
+            scheduledPlaybackSources.add(source);
+            source.onended = () => scheduledPlaybackSources.delete(source);
 
             const now = virtualMicCtx.currentTime;
             const BUFFER_DELAY =0.5; // second buffer to give time to the classifier
@@ -67,7 +114,10 @@
     };
 
     // CAPTURE: Meeting -> AI
-    const captureCtx = new AudioContext({ sampleRate: 24000 });
+    // 16kHz to match Nova Sonic's confirmed audioInput sample rate (the
+    // previous Azure OpenAI Realtime backend used 24kHz here) -- capturing
+    // directly at the target rate avoids a separate resampling step.
+    const captureCtx = captureGateCtx;  // reuse the same AudioContext
     const captureDest = captureCtx.createMediaStreamDestination();
     const connectedStreamIds = new Set();
     let announcedParticipant = false;
@@ -127,8 +177,11 @@
         const source = captureCtx.createMediaStreamSource(captureDest.stream);
         const filteredDest = captureCtx.createMediaStreamDestination();
 
-        // Source -> HighPass -> BandPass -> PreAmp -> AI Reader
-        source.connect(hpFilter);
+        // Source -> CaptureGate -> HighPass -> BandPass -> PreAmp -> AI Reader
+        // CaptureGate is closed (gain=0) while AI audio is playing to prevent
+        // Teams' loopback of the AI's own voice from reaching Nova Sonic.
+        source.connect(captureGate);
+        captureGate.connect(hpFilter);
         hpFilter.connect(bpFilter);
         bpFilter.connect(preAmp);
         preAmp.connect(filteredDest);
@@ -182,6 +235,7 @@
                     //window.__virtualMicGainNode.gain.setValueAtTime(0, virtualMicCtx.currentTime);
                     if (!isSpeakingLocal) {
                         isSpeakingLocal = true;
+                        stopScheduledPlayback();
                         socket.send(JSON.stringify({ type: "speaking_status", speaking: true }));
                     }
                     if (silenceTimer) {
@@ -252,10 +306,10 @@
     // the Python backend so it can ask them to turn it on if it's off (see
     // the "video_status" handling in connection.py). Starts true so we never
     // prompt before any <video> element has even shown up yet.
-    let lastVideoOnState = true;
+    let lastVideoOnState = false;
 
     function checkVideoStatus() {
-        let anyVideoOn = false;
+        let liveVideoCount = 0;
         let videoElementCount = 0;
         const trackDebug = [];
         findMediaElements(document.body).forEach(el => {
@@ -265,20 +319,19 @@
             const videoTracks = el.srcObject.getVideoTracks ? el.srcObject.getVideoTracks() : [];
             videoTracks.forEach(track => {
                 trackDebug.push(`readyState=${track.readyState},enabled=${track.enabled},muted=${track.muted}`);
-                if (track.readyState === 'live' && track.enabled !== false) anyVideoOn = true;
+                if (track.readyState === 'live' && track.enabled !== false) liveVideoCount++;
             });
         });
-        // Unverified against a live Teams build yet -- logged every poll
-        // (not just on change) so the first real test tells us whether Teams
-        // actually represents remote camera-off this way (track.enabled or
-        // readyState changing) or some other way entirely (e.g. no <video>
-        // element at all, or the track staying "live"/enabled regardless).
-        console.log(`[AudioPayload] [VIDEO CHECK] videoElements=${videoElementCount} tracks=[${trackDebug.join(' | ') || 'none'}] anyVideoOn=${anyVideoOn}`);
-        if (anyVideoOn !== lastVideoOnState) {
-            lastVideoOnState = anyVideoOn;
+        // The bot's own virtual camera always contributes 1 live video track
+        // (self-view). The candidate's camera adds a second. So the candidate's
+        // camera is considered on only when there are 2+ live video tracks.
+        const candidateVideoOn = liveVideoCount >= 2;
+        console.log(`[AudioPayload] [VIDEO CHECK] videoElements=${videoElementCount} liveVideoTracks=${liveVideoCount} candidateVideoOn=${candidateVideoOn} tracks=[${trackDebug.join(' | ') || 'none'}]`);
+        if (candidateVideoOn !== lastVideoOnState) {
+            lastVideoOnState = candidateVideoOn;
             if (socket.readyState === WebSocket.OPEN) {
-                socket.send(JSON.stringify({ type: 'video_status', enabled: anyVideoOn }));
-                console.log('[AudioPayload] Video status changed:', anyVideoOn ? 'ON' : 'OFF');
+                socket.send(JSON.stringify({ type: 'video_status', enabled: candidateVideoOn }));
+                console.log('[AudioPayload] Video status changed:', candidateVideoOn ? 'ON' : 'OFF');
             }
         }
     }

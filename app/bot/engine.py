@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 import playwright
 import websockets
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 from playwright_stealth import Stealth
 
 from app.config import get_settings
@@ -24,6 +24,8 @@ BASE_DIR = Path(__file__).parent
 SIGNED_IN_PROFILE_DIR = BASE_DIR / "browser_profile"
 ADMITTER_STATE_FILE = BASE_DIR / "admitter_state.json"
 AVATAR_IMAGE_FILE = BASE_DIR.parent / "realtime" / "image.png"
+GUEST_NAVIGATION_TIMEOUT_MS = 90_000
+GUEST_NAVIGATION_ATTEMPTS = 2
 
 
 @functools.lru_cache(maxsize=1)
@@ -193,10 +195,14 @@ async def launch_bot(
     bound_port = {"value": None}
 
     async def start_server():
+        # ping_interval=None disables keepalive pings on this localhost-only
+        # connection. The default 20s ping causes spurious 1011 closes when the
+        # Teams page JS crashes and stops responding to WebSocket pong frames.
         async with websockets.serve(
             lambda ws: handle_voice_bridge_ws(ws, details, end_call_callback=end_call_action),
             settings.websocket_host,
             0,
+            ping_interval=None,
         ) as server:
             bound_port["value"] = server.sockets[0].getsockname()[1]
             await stop_event.wait()
@@ -238,7 +244,7 @@ async def launch_bot(
         # NEW: Assign the active page to our reference so the callback can use it
         page_ref["page"] = page
 
-        page.on("console", lambda msg: log.info(f"[BROWSER] {msg.text}"))
+        page.on("console", lambda msg: log.debug(f"[BROWSER] {msg.text}"))
         page.on("pageerror", lambda exc: log.error(f"[BROWSER ERROR] {exc}"))
         # Low-confidence extra layer: page.on("dialog") is for JS alert/
         # confirm/prompt/beforeunload, a different CDP mechanism than
@@ -335,7 +341,7 @@ async def _run_admitter_session(meeting_url: str, ready_event: asyncio.Event | N
         await _block_external_app_launch(context, log)
 
         page = context.pages[0] if context.pages else await context.new_page()
-        page.on("console", lambda msg: log.info(f"[ADMITTER BROWSER] {msg.text}"))
+        page.on("console", lambda msg: log.debug(f"[ADMITTER BROWSER] {msg.text}"))
         page.on("pageerror", lambda exc: log.error(f"[ADMITTER BROWSER ERROR] {exc}"))
         page.on("dialog", lambda dialog: asyncio.create_task(dialog.dismiss()))
         try:
@@ -405,7 +411,7 @@ async def _run_admitter_tab(browser, meeting_url: str, ready_event: asyncio.Even
     context = await browser.new_context(storage_state=str(ADMITTER_STATE_FILE), **_CONTEXT_KWARGS)
     await _block_external_app_launch(context, log)
     page = await context.new_page()
-    page.on("console", lambda msg: log.info(f"[ADMITTER BROWSER] {msg.text}"))
+    page.on("console", lambda msg: log.debug(f"[ADMITTER BROWSER] {msg.text}"))
     page.on("pageerror", lambda exc: log.error(f"[ADMITTER BROWSER ERROR] {exc}"))
     page.on("dialog", lambda dialog: asyncio.create_task(dialog.dismiss()))
     try:
@@ -456,10 +462,14 @@ async def _run_guest_tab(browser, meeting_url: str, details: dict, admitter_read
     bound_port = {"value": None}
 
     async def start_server():
+        # ping_interval=None disables keepalive pings on this localhost-only
+        # connection. The default 20s ping causes spurious 1011 closes when the
+        # Teams page JS crashes and stops responding to WebSocket pong frames.
         async with websockets.serve(
             lambda ws: handle_voice_bridge_ws(ws, details, end_call_callback=end_call_action),
             settings.websocket_host,
             0,
+            ping_interval=None,
         ) as server:
             bound_port["value"] = server.sockets[0].getsockname()[1]
             await stop_event.wait()
@@ -481,7 +491,7 @@ async def _run_guest_tab(browser, meeting_url: str, details: dict, admitter_read
     page = context.pages[0] if context.pages else await context.new_page()
     page_ref["page"] = page
 
-    page.on("console", lambda msg: log.info(f"[BROWSER] {msg.text}"))
+    page.on("console", lambda msg: log.debug(f"[BROWSER] {msg.text}"))
     page.on("pageerror", lambda exc: log.error(f"[BROWSER ERROR] {exc}"))
     page.on("dialog", lambda dialog: asyncio.create_task(dialog.dismiss()))
 
@@ -490,7 +500,16 @@ async def _run_guest_tab(browser, meeting_url: str, details: dict, admitter_read
         await page.add_init_script(stealth_js)
         await page.add_init_script(interceptor_js)
         log.info(f"Navigating to Teams Room Link: {meeting_url}")
-        await page.goto(meeting_url, wait_until="domcontentloaded")
+        # Teams' bundles sometimes load slowly from its CDN; allow a longer
+        # first load and one retry before failing the whole interview.
+        for attempt in range(1, GUEST_NAVIGATION_ATTEMPTS + 1):
+            try:
+                await page.goto(meeting_url, wait_until="domcontentloaded", timeout=GUEST_NAVIGATION_TIMEOUT_MS)
+                break
+            except PlaywrightTimeoutError:
+                if attempt == GUEST_NAVIGATION_ATTEMPTS:
+                    raise
+                log.warning(f"Teams page load timed out (attempt {attempt}/{GUEST_NAVIGATION_ATTEMPTS}); retrying.")
 
         await do_teams_join(page)
 

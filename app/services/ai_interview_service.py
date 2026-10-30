@@ -61,10 +61,14 @@ async def load_assessment_plan(assessment_plan_id: UUID, assessment_plan_version
     Returns a dict shaped like:
     {
         "candidate_name": str, "position_title": str, "duration_minutes": int,
-        "competencies": [str, ...], "indicators": [str, ...],
-        "questions": [{"id": "q1", "text": "..."}, ...],  # exactly 4
-        "resume_claim": str,
+        "competencies": [{"competency_id", "name", "priority", "source"}, ...],
+        "questions": [{"question_id", "priority", "question", "competency_id",
+                        "expected_answer", "evidence": [...], "target_seconds"}, ...],
+        "job_snapshot": {...}, "candidate_summary_snapshot": {...},
     }
+    (Competencies/questions/job_snapshot/candidate_summary_snapshot are passed
+    through whole -- consumers like build_module2_instructions() read the
+    richer fields directly rather than this function flattening them away.)
     Raises PlanNotFoundError instead of silently proceeding with
     fabricated/placeholder data.
     """
@@ -87,18 +91,14 @@ async def load_assessment_plan(assessment_plan_id: UUID, assessment_plan_version
     job_snapshot = _load_jsonb(row["job_snapshot_json"])
     candidate_snapshot = _load_jsonb(row["candidate_summary_snapshot_json"])
 
-    competencies = plan_json.get("competencies", [])
-    questions = plan_json.get("questions", [])
-    resume_question = next((q for q in questions if q.get("type") == "RESUME_BASED"), None)
-
     return {
         "candidate_name": candidate_snapshot.get("full_name") or "Candidate",
         "position_title": job_snapshot.get("job_title"),
         "duration_minutes": row["duration_minutes"],
-        "competencies": [c.get("name") for c in competencies],
-        "indicators": [i for c in competencies for i in c.get("assessment_indicators", [])],
-        "questions": [{"id": q.get("question_id"), "text": q.get("question")} for q in questions],
-        "resume_claim": resume_question.get("question", "") if resume_question else "",
+        "competencies": plan_json.get("competencies", []),
+        "questions": plan_json.get("questions", []),
+        "job_snapshot": job_snapshot,
+        "candidate_summary_snapshot": candidate_snapshot,
     }
 
 
@@ -229,6 +229,7 @@ async def schedule_ai_interview(
         "duration_minutes": duration_minutes,
         "interview_id": redis_interview_id,
         "pg_session_id": str(session_id),
+        "assessment_plan_id": str(assessment_plan_id),
     }
 
     await state_machine.init_state(

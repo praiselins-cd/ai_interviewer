@@ -1,4 +1,5 @@
 import asyncio
+import os
 import sys
 
 if sys.platform == "win32":
@@ -10,20 +11,23 @@ from app.api.ai_interviews_routes import router as ai_interviews_router
 from app.api.internal_routes import router as internal_router
 from app.infra.redis_client import get_redis
 from app.db.postgres import get_pool
+from app.repositories import ai_interview_repo
 from app.scheduling.scheduler import run_scheduler_loop
 from app.scheduling.capacity import reconcile_active_set
 from app.worker.supervisor import run_supervisor_loop
 import logging
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
+for _noisy_logger in ("uvicorn.access", "botocore", "boto3", "websockets", "asyncio"):
+    logging.getLogger(_noisy_logger).setLevel(logging.WARNING)
 logger = logging.getLogger("app.main")
 
 app = FastAPI(
     title="Proxy Realtime AI Interviewer",
-    description="Automated Playwright system integrated with Azure OpenAI Realtime audio frameworks."
+    description="Automated Playwright system integrated with Amazon Nova Sonic (AWS Bedrock) speech-to-speech audio frameworks."
 )
 
 app.include_router(api_router, prefix="/api")
@@ -54,6 +58,12 @@ async def on_startup():
     except Exception as e:
         logger.error(f"Postgres is not reachable at startup ({e}); Module 2's ai_interviews/sessions/"
                      f"transcript/events tables are unavailable — scheduling will fail.")
+    else:
+        try:
+            await ai_interview_repo.ensure_llm_usage_table()
+        except Exception as e:
+            logger.warning(f"Could not create ai_interviewer_llm_usage ({e}); token usage/cost "
+                           f"will not be recorded until it exists.")
 
     # Background loops for the whole worker-pool lifecycle: the scheduler
     # pre-warms/dispatches due interviews within capacity, the supervisor

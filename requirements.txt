@@ -2,6 +2,11 @@ playwright==1.63.0
 playwright-stealth
 websockets
 python-dotenv
+# Nova Sonic (AWS Bedrock speech-to-speech) -- experimental Smithy-based SDK;
+# boto3/aiobotocore do not support bidirectional streaming at all, so this
+# (not boto3) is the only option. Requires Python >= 3.12.
+aws_sdk_bedrock_runtime[awscrt]
+smithy_aws_core
 google-api-python-client
 google-auth
 google-auth-oauthlib

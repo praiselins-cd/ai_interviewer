@@ -2,10 +2,25 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from functools import lru_cache
 
 class Settings(BaseSettings):
-    # Realtime API
-    realtimeapi_azure_openai_service_endpoint: str
-    realtimeapi_azure_openai_deployment_model_name: str
-    realtimeapi_azure_openai_service_key: str
+    # Realtime voice API: Amazon Nova Sonic via AWS Bedrock's bidirectional
+    # streaming (InvokeModelWithBidirectionalStream) -- not a plain API key
+    # like the previous Azure OpenAI Realtime setup. The current client uses
+    # environment credentials; set these for local dev, or provide AWS
+    # credentials in the worker process environment. An EC2 role is not
+    # resolved automatically by this configuration.
+    aws_region: str = "us-east-1"
+    bedrock_model_id: str = "amazon.nova-sonic-v1:0"
+    bedrock_voice_id: str = "matthew"
+    # Nova Sonic USD rates per 1M tokens, used to compute cost_usd for the
+    # ai_interviewer_llm_usage row. Defaults are AWS's Nova 2 Sonic rates;
+    # update them here (or in .env) if AWS pricing or the model changes.
+    nova_sonic_speech_in_per_m: float = 3.0
+    nova_sonic_speech_out_per_m: float = 12.0
+    nova_sonic_text_in_per_m: float = 0.319
+    nova_sonic_text_out_per_m: float = 2.651
+    aws_access_key_id: str = ""
+    aws_secret_access_key: str = ""
+    aws_session_token: str = ""
 
     # Base Web Server Options
     bot_name: str = "Proxy AI Interviewer"
